@@ -159,43 +159,6 @@ def ss_record(conn, order_id, created, deducted, detail):
     conn.commit()
 
 
-def ss_try_claim(conn, order_id):
-    """Atomically claim an order for ShipStation creation.
-
-    Returns True only if THIS call won the claim (no prior run had already set
-    ss_order_created). Closes the race where two overlapping runs both read
-    ss_order_created=0, both POST, and create a DUPLICATE order (the #3643 bug).
-
-    Mechanism: a single UPDATE that flips ss_order_created 0->1 only if it is
-    currently 0. SQLite serializes writes, so exactly one concurrent run's UPDATE
-    affects the row; the loser sees rowcount 0 and backs off. We claim BEFORE the
-    network POST, so a second run can never also POST. If the POST later fails, we
-    release the claim (ss_release_claim) so it retries next run."""
-    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    conn.execute(
-        """INSERT OR IGNORE INTO sent_orders (order_id, phone, name, status, texted_at)
-           VALUES (?, NULL, NULL, 'ship_only', ?);""",
-        (order_id, now),
-    )
-    cur = conn.execute(
-        """UPDATE sent_orders
-           SET ss_order_created=1, ss_detail='claim: creating'
-           WHERE order_id=? AND (ss_order_created IS NULL OR ss_order_created=0);""",
-        (order_id,),
-    )
-    conn.commit()
-    return cur.rowcount == 1  # True = we won the claim
-
-
-def ss_release_claim(conn, order_id, detail):
-    """Undo a claim if the POST failed, so the order is retried next run."""
-    conn.execute(
-        "UPDATE sent_orders SET ss_order_created=0, ss_detail=? WHERE order_id=?;",
-        (detail, order_id),
-    )
-    conn.commit()
-
-
 def already_processed(conn, order_id):
     """True if this order has already been handled for SMS.
 
@@ -565,70 +528,27 @@ def ss_create_order(order):
         return False, f"exception: {e}"
 
 
-def ss_order_exists(order_id):
-    """Belt-and-suspenders: ask ShipStation whether an order with this orderKey
-    already exists. Returns True/False, or None if the check itself failed (so the
-    caller can decide safely). Catches the case where a previous run POSTed but
-    crashed before recording to the DB, or the DB was wiped."""
-    try:
-        r = requests.get(
-            f"{SHIP_V1_BASE}/orders",
-            auth=SHIP_V1_AUTH,
-            params={"orderKey": f"wc-{order_id}"},
-            timeout=30,
-        )
-        if not (200 <= r.status_code < 300):
-            return None  # unknown — don't assume
-        data = r.json()
-        return int(data.get("total", 0) or 0) > 0
-    except Exception:
-        return None  # unknown — don't assume
-
-
 def sync_order_to_shipstation(conn, order, oid, order_number):
-    """Push one order to ShipStation (V1), idempotently and race-safe.
-
-    Duplicate prevention (fixes the #3643 double-order bug) has three layers:
-      1. Atomic DB claim BEFORE the POST — two overlapping runs can't both proceed.
-      2. A pre-POST lookup against ShipStation by orderKey — catches DB-wipe /
-         crash-after-post cases.
-      3. ShipStation's own orderKey upsert on the POST itself.
-    Honors SEND_MODE (dry-run)."""
+    """Push one order to ShipStation (V1), idempotently. Independent of SMS.
+    Safe to re-run: once ss_order_created=1 it's skipped. Honors SEND_MODE."""
     if not _SHIP_ENABLED:
         return  # ShipStation creds not configured; silently skip
 
     created, _ = ss_state(conn, oid)
     if created:
-        return  # already pushed (or claimed) — nothing to do
+        return  # already pushed
 
     if not SEND_MODE:
         n_items = len(order.get("line_items") or [])
         log.info("WOULD SHIP      order #%s -> create in ShipStation (%d item(s))", oid, n_items)
         return
 
-    # LAYER 1: atomically claim this order. If we don't win, another run is
-    # handling it — back off without posting.
-    if not ss_try_claim(conn, oid):
-        log.info("SKIP (claimed)  order #%s already being created by another run", oid)
-        return
-
-    # LAYER 2: before creating, verify ShipStation doesn't already have it.
-    exists = ss_order_exists(oid)
-    if exists is True:
-        ss_record(conn, oid, 1, 1, "already existed in ShipStation (pre-check)")
-        log.info("SKIP (exists)   order #%s already in ShipStation — not re-created", oid)
-        return
-    # exists is False (safe to create) or None (unknown — proceed; orderKey upsert
-    # on the POST is the final safety net).
-
-    # LAYER 3: POST (ShipStation upserts on orderKey).
     ok, msg = ss_create_order(order)
     if not ok:
-        # Release the claim so a genuine failure retries next run.
-        ss_release_claim(conn, oid, f"create failed: {msg}")
+        ss_record(conn, oid, 0, 0, f"create failed: {msg}")
         log.error("SHIP create FAILED order #%s: %s", oid, msg)
-        return
-    ss_record(conn, oid, 1, 1, "order created")
+        return  # left unrecorded-as-done -> retried next run
+    ss_record(conn, oid, 1, 1, "order created")   # deducted flag unused; set 1 to mark complete
     log.info("=SHIPPED= order #%s created in ShipStation", oid)
 
 
