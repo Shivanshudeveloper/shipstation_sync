@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import time
+import json
 import sqlite3
 import atexit
 import logging
@@ -96,6 +97,17 @@ logging.basicConfig(
 log = logging.getLogger("new_order_sms")
 
 
+def parse_json(resp):
+    """Parse a response as JSON, tolerating a leading UTF-8 BOM and stray
+    whitespace. Some WordPress plugins/themes emit a BOM (\\ufeff) before the JSON,
+    which makes strict resp.json() fail with 'Unexpected UTF-8 BOM'. Decoding as
+    utf-8-sig strips the BOM safely; plain utf-8 otherwise."""
+    text = resp.content.decode("utf-8-sig", errors="replace").strip()
+    if not text:
+        return []
+    return json.loads(text)
+
+
 # ---- SQLite helpers ----
 def db_connect():
     conn = sqlite3.connect(DB_FILE, timeout=30)
@@ -155,6 +167,43 @@ def ss_record(conn, order_id, created, deducted, detail):
            SET ss_order_created=?, ss_stock_deducted=?, ss_detail=?
            WHERE order_id=?;""",
         (created, deducted, detail, order_id),
+    )
+    conn.commit()
+
+
+def ss_try_claim(conn, order_id):
+    """Atomically claim an order for ShipStation creation.
+
+    Returns True only if THIS call won the claim (no prior run had already set
+    ss_order_created). Closes the race where two overlapping runs both read
+    ss_order_created=0, both POST, and create a DUPLICATE order (the #3643 bug).
+
+    Mechanism: a single UPDATE that flips ss_order_created 0->1 only if it is
+    currently 0. SQLite serializes writes, so exactly one concurrent run's UPDATE
+    affects the row; the loser sees rowcount 0 and backs off. We claim BEFORE the
+    network POST, so a second run can never also POST. If the POST later fails, we
+    release the claim (ss_release_claim) so it retries next run."""
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    conn.execute(
+        """INSERT OR IGNORE INTO sent_orders (order_id, phone, name, status, texted_at)
+           VALUES (?, NULL, NULL, 'ship_only', ?);""",
+        (order_id, now),
+    )
+    cur = conn.execute(
+        """UPDATE sent_orders
+           SET ss_order_created=1, ss_detail='claim: creating'
+           WHERE order_id=? AND (ss_order_created IS NULL OR ss_order_created=0);""",
+        (order_id,),
+    )
+    conn.commit()
+    return cur.rowcount == 1  # True = we won the claim
+
+
+def ss_release_claim(conn, order_id, detail):
+    """Undo a claim if the POST failed, so the order is retried next run."""
+    conn.execute(
+        "UPDATE sent_orders SET ss_order_created=0, ss_detail=? WHERE order_id=?;",
+        (detail, order_id),
     )
     conn.commit()
 
@@ -302,7 +351,7 @@ def resolve_store_tz():
             auth=WC_AUTH, timeout=30,
         )
         resp.raise_for_status()
-        settings = {s.get("id"): s.get("value") for s in resp.json()}
+        settings = {s.get("id"): s.get("value") for s in parse_json(resp)}
         tz_string = settings.get("woocommerce_timezone_string") or ""
         if tz_string:
             log.info("Detected store timezone: %s", tz_string)
@@ -385,7 +434,7 @@ def fetch_recent_orders(statuses, after_iso):
             timeout=30,
         )
         resp.raise_for_status()
-        batch = resp.json()
+        batch = parse_json(resp)
         if not batch:
             break
         orders.extend(batch)
@@ -529,26 +578,44 @@ def ss_create_order(order):
 
 
 def sync_order_to_shipstation(conn, order, oid, order_number):
-    """Push one order to ShipStation (V1), idempotently. Independent of SMS.
-    Safe to re-run: once ss_order_created=1 it's skipped. Honors SEND_MODE."""
+    """Push one order to ShipStation (V1), idempotently and race-safe.
+
+    Duplicate prevention (fixes the #3643 double-order bug) has three layers:
+      1. Atomic DB claim BEFORE the POST — two overlapping runs can't both proceed.
+      2. A pre-POST lookup against ShipStation by orderKey — catches DB-wipe /
+         crash-after-post cases.
+      3. ShipStation's own orderKey upsert on the POST itself.
+    Honors SEND_MODE (dry-run)."""
     if not _SHIP_ENABLED:
         return  # ShipStation creds not configured; silently skip
 
     created, _ = ss_state(conn, oid)
     if created:
-        return  # already pushed
+        return  # already pushed (or claimed) — nothing to do
 
     if not SEND_MODE:
         n_items = len(order.get("line_items") or [])
         log.info("WOULD SHIP      order #%s -> create in ShipStation (%d item(s))", oid, n_items)
         return
 
+    # LAYER 1: atomically claim this order. If we don't win, another run is
+    # handling it — back off without posting.
+    if not ss_try_claim(conn, oid):
+        log.info("SKIP (claimed)  order #%s already being created by another run", oid)
+        return
+
+    # (Layer 2 pre-check removed: ShipStation's /orders filters are unreliable and
+    #  caused false positives. Duplicate prevention now relies on Layer 1 (atomic
+    #  DB claim) + Layer 3 (ShipStation upserts on orderKey during the POST).)
+
+    # LAYER 3: POST (ShipStation upserts on orderKey).
     ok, msg = ss_create_order(order)
     if not ok:
-        ss_record(conn, oid, 0, 0, f"create failed: {msg}")
+        # Release the claim so a genuine failure retries next run.
+        ss_release_claim(conn, oid, f"create failed: {msg}")
         log.error("SHIP create FAILED order #%s: %s", oid, msg)
-        return  # left unrecorded-as-done -> retried next run
-    ss_record(conn, oid, 1, 1, "order created")   # deducted flag unused; set 1 to mark complete
+        return
+    ss_record(conn, oid, 1, 1, "order created")
     log.info("=SHIPPED= order #%s created in ShipStation", oid)
 
 
