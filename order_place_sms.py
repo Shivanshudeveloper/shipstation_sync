@@ -495,13 +495,25 @@ def run_testsend():
 # =====================================================================
 
 def parse_sku(sku):
-    """Split a WooCommerce pack SKU into (base_sku, pack_size).
-       'PX-CU50-3' -> ('PX-CU50', 3);  'PX-CU50' -> ('PX-CU50', 1).
-    Only -3/-5/-10 are treated as pack suffixes, so 'PX-CU50' (ending in 50)
-    is never mis-split."""
+    """Split a WooCommerce variant SKU into (base_sku, vial_count).
+
+       'PX-RT10-10' -> ('PX-RT10', 10);  'PX-CU50-3' -> ('PX-CU50', 3);
+       'PX-RT10-20' -> ('PX-RT10', 20);  'PX-CU50'    -> ('PX-CU50', 1).
+
+    A WooCommerce variant SKU is <base>-<vials>, where <vials> is the trailing
+    number after the LAST dash. We treat ANY trailing -<number> as the vial count
+    (not a fixed 3/5/10 whitelist), so new variant sizes like -20 work with no
+    code change. The greedy (.*) means bases that themselves end in a number
+    (PX-RT10, PX-CU50) still split correctly: 'PX-RT10-10' -> base 'PX-RT10',
+    vials 10 — because the regex anchors on the FINAL '-<number>'.
+
+    IMPORTANT: this assumes every WooCommerce SKU's trailing '-<number>' is a vial
+    count. If you ever add a product whose real base SKU legitimately ends in
+    '-<number>' (where that number is NOT vials), it would be mis-split — add an
+    explicit exception here for it."""
     if not sku:
         return sku, 1
-    m = re.match(r"^(.*)-(3|5|10)$", sku)
+    m = re.match(r"^(.*)-(\d+)$", sku)
     if m:
         return m.group(1), int(m.group(2))
     return sku, 1
