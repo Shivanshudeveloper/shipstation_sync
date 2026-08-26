@@ -495,25 +495,13 @@ def run_testsend():
 # =====================================================================
 
 def parse_sku(sku):
-    """Split a WooCommerce variant SKU into (base_sku, vial_count).
-
-       'PX-RT10-10' -> ('PX-RT10', 10);  'PX-CU50-3' -> ('PX-CU50', 3);
-       'PX-RT10-20' -> ('PX-RT10', 20);  'PX-CU50'    -> ('PX-CU50', 1).
-
-    A WooCommerce variant SKU is <base>-<vials>, where <vials> is the trailing
-    number after the LAST dash. We treat ANY trailing -<number> as the vial count
-    (not a fixed 3/5/10 whitelist), so new variant sizes like -20 work with no
-    code change. The greedy (.*) means bases that themselves end in a number
-    (PX-RT10, PX-CU50) still split correctly: 'PX-RT10-10' -> base 'PX-RT10',
-    vials 10 — because the regex anchors on the FINAL '-<number>'.
-
-    IMPORTANT: this assumes every WooCommerce SKU's trailing '-<number>' is a vial
-    count. If you ever add a product whose real base SKU legitimately ends in
-    '-<number>' (where that number is NOT vials), it would be mis-split — add an
-    explicit exception here for it."""
+    """Split a WooCommerce pack SKU into (base_sku, pack_size).
+       'PX-CU50-3' -> ('PX-CU50', 3);  'PX-CU50' -> ('PX-CU50', 1).
+    Only -3/-5/-10 are treated as pack suffixes, so 'PX-CU50' (ending in 50)
+    is never mis-split."""
     if not sku:
         return sku, 1
-    m = re.match(r"^(.*)-(\d+)$", sku)
+    m = re.match(r"^(.*)-(3|5|10)$", sku)
     if m:
         return m.group(1), int(m.group(2))
     return sku, 1
@@ -533,6 +521,55 @@ def _ss_addr(node):
         "country": node.get("country") or None,
         "phone": node.get("phone") or None,
     }
+
+
+def _extract_shipping_method(order):
+    """Pull the customer's chosen shipping method from the WooCommerce order and
+    map it to ShipStation fields. Returns a dict with any of:
+        requestedShippingService (always, free text — safe, just displays)
+        carrierCode, serviceCode (only when confidently mapped)
+
+    WooCommerce stores the chosen method in order['shipping_lines']; each line has
+    a human 'method_title' (e.g. 'USPS Ground Advantage') and a 'method_id'.
+    We ALWAYS pass the title as requestedShippingService (can't cause errors), and
+    additionally map carrier/service codes for the known checkout options so the
+    fulfillment team sees the right carrier pre-selected. Unknown methods still get
+    the title, just no code — never an error."""
+    lines = order.get("shipping_lines")
+    if not isinstance(lines, list) or not lines:
+        return {}
+    line = lines[0] if isinstance(lines[0], dict) else {}
+    title = (line.get("method_title") or "").strip()
+    if not title:
+        return {}
+
+    out = {"requestedShippingService": title}
+
+    # Conservative mapping keyed on the checkout labels PureX uses.
+    # carrierCode values are ShipStation's standard codes; serviceCode values are
+    # left blank unless we're confident, because a wrong serviceCode is rejected.
+    t = title.lower()
+    if "usps" in t or "ground advantage" in t:
+        out["carrierCode"] = "stamps_com"          # USPS is 'stamps_com' in ShipStation
+        out["serviceCode"] = "usps_ground_advantage"
+    elif "fedex" in t and ("next" in t or "overnight" in t or "1 " in t):
+        out["carrierCode"] = "fedex"
+        out["serviceCode"] = "fedex_standard_overnight"
+    elif "fedex" in t and "2" in t:
+        out["carrierCode"] = "fedex"
+        out["serviceCode"] = "fedex_2day"
+    elif "ups" in t and ("next" in t or "1 " in t):
+        out["carrierCode"] = "ups"
+        out["serviceCode"] = "ups_next_day_air"
+    elif "ups" in t and "2" in t:
+        out["carrierCode"] = "ups"
+        out["serviceCode"] = "ups_2nd_day_air"
+    elif "free" in t and "2-day" in t:
+        # "FREE 2-Day Shipping" — carrier not fixed; leave codes blank so the team
+        # picks the cheapest 2-day. Title still tells them it's a free 2-day order.
+        pass
+    # else: unknown method -> title only, no codes.
+    return out
 
 
 def ss_create_order(order):
@@ -580,6 +617,10 @@ def ss_create_order(order):
         "shipTo": ship_to,
         "items": items,
     }
+    # Add the customer's chosen shipping method (requestedShippingService, and
+    # carrier/service codes when confidently mapped). Additive only — if the order
+    # has no shipping method, nothing is added and behavior is unchanged.
+    body.update(_extract_shipping_method(order))
     try:
         r = requests.post(f"{SHIP_V1_BASE}/orders/createorder",
                           auth=SHIP_V1_AUTH, json=body, timeout=30)
