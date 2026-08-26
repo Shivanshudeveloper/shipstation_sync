@@ -525,18 +525,20 @@ def _ss_addr(node):
 
 def _extract_shipping_method(order):
     """Pull the customer's chosen shipping method from the WooCommerce order and
-    pass it to ShipStation as requestedShippingService (free text only).
+    map it to ShipStation fields using THIS ACCOUNT'S REAL carrier/service codes
+    (from list_ss_services.py). Returns a dict with:
+        requestedShippingService (always — free text, always accepted)
+        carrierCode + serviceCode (when the method maps to a known service)
 
-    We deliberately do NOT set carrierCode/serviceCode: those must match
-    ShipStation's exact per-account codes, and a wrong serviceCode makes the
-    ENTIRE createorder call fail with 'Invalid serviceCode' (HTTP 400) — which
-    blocks the order. requestedShippingService is free text and is always
-    accepted; it displays the customer's choice in ShipStation, and you map each
-    label to a real service once via ShipStation's 'Map Requested Service' dialog
-    (after which ShipStation auto-applies it to all future orders with that label).
+    Account carrier codes (important — these are non-standard):
+        USPS  -> 'stamps_com'
+        UPS   -> 'ups_walleted'
+        FedEx -> 'fedex_walleted'
 
-    WooCommerce stores the chosen method in order['shipping_lines'][*]['method_title'].
-    Returns {} if there's no shipping method (behavior then unchanged)."""
+    If the method isn't recognized, only the free-text label is sent (safe,
+    shows as 'unmapped' in ShipStation but the order still creates). And even for
+    mapped methods, ss_create_order will RETRY without the codes if ShipStation
+    ever rejects them, so a bad code can never block an order."""
     lines = order.get("shipping_lines")
     if not isinstance(lines, list) or not lines:
         return {}
@@ -544,7 +546,27 @@ def _extract_shipping_method(order):
     title = (line.get("method_title") or "").strip()
     if not title:
         return {}
-    return {"requestedShippingService": title}
+
+    out = {"requestedShippingService": title}
+    t = title.lower()
+
+    if "usps" in t or "ground advantage" in t:
+        out["carrierCode"] = "stamps_com"
+        out["serviceCode"] = "usps_ground_advantage"
+    elif "fedex" in t and ("next" in t or "overnight" in t):
+        out["carrierCode"] = "fedex_walleted"
+        out["serviceCode"] = "fedex_standard_overnight"
+    elif "fedex" in t and "2" in t:
+        out["carrierCode"] = "fedex_walleted"
+        out["serviceCode"] = "fedex_2day"
+    elif "ups" in t and ("next" in t or "overnight" in t):
+        out["carrierCode"] = "ups_walleted"
+        out["serviceCode"] = "ups_next_day_air_saver"
+    elif "ups" in t and "2" in t:
+        out["carrierCode"] = "ups_walleted"
+        out["serviceCode"] = "ups_2nd_day_air"
+    # "FREE 2-Day Shipping" and anything else -> label only (carrier not fixed).
+    return out
 
 
 def ss_create_order(order):
@@ -592,14 +614,33 @@ def ss_create_order(order):
         "shipTo": ship_to,
         "items": items,
     }
-    # Add the customer's chosen shipping method (requestedShippingService, and
-    # carrier/service codes when confidently mapped). Additive only — if the order
-    # has no shipping method, nothing is added and behavior is unchanged.
-    body.update(_extract_shipping_method(order))
+    # Add the customer's chosen shipping method (requestedShippingService, plus
+    # carrier/service codes when mapped). Additive only.
+    ship_fields = _extract_shipping_method(order)
+    body.update(ship_fields)
     try:
         r = requests.post(f"{SHIP_V1_BASE}/orders/createorder",
                           auth=SHIP_V1_AUTH, json=body, timeout=30)
         ok = 200 <= r.status_code < 300
+
+        # SAFETY NET: if ShipStation rejects the service/carrier code (e.g. a code
+        # that doesn't match this account), DON'T fail the order. Retry once with
+        # the carrier/service codes stripped — keeping only the free-text label —
+        # so the order is always created (it just shows as 'unmapped', which the
+        # team can map in one click). A bad code can never block an order.
+        if (not ok) and ("serviceCode" in body or "carrierCode" in body) \
+                and ("servicecode" in r.text.lower() or "carriercode" in r.text.lower()):
+            body.pop("carrierCode", None)
+            body.pop("serviceCode", None)
+            # keep requestedShippingService (the label) so the choice still shows
+            r2 = requests.post(f"{SHIP_V1_BASE}/orders/createorder",
+                               auth=SHIP_V1_AUTH, json=body, timeout=30)
+            ok2 = 200 <= r2.status_code < 300
+            if ok2:
+                return True, (f"created WITHOUT service code (code rejected, left "
+                              f"unmapped): first={r.status_code} retry={r2.status_code}")
+            return False, f"HTTP {r2.status_code} (retry w/o codes): {r2.text[:160]}"
+
         return ok, f"HTTP {r.status_code}: {r.text[:180]}"
     except Exception as e:
         return False, f"exception: {e}"
