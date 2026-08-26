@@ -525,16 +525,18 @@ def _ss_addr(node):
 
 def _extract_shipping_method(order):
     """Pull the customer's chosen shipping method from the WooCommerce order and
-    map it to ShipStation fields. Returns a dict with any of:
-        requestedShippingService (always, free text — safe, just displays)
-        carrierCode, serviceCode (only when confidently mapped)
+    pass it to ShipStation as requestedShippingService (free text only).
 
-    WooCommerce stores the chosen method in order['shipping_lines']; each line has
-    a human 'method_title' (e.g. 'USPS Ground Advantage') and a 'method_id'.
-    We ALWAYS pass the title as requestedShippingService (can't cause errors), and
-    additionally map carrier/service codes for the known checkout options so the
-    fulfillment team sees the right carrier pre-selected. Unknown methods still get
-    the title, just no code — never an error."""
+    We deliberately do NOT set carrierCode/serviceCode: those must match
+    ShipStation's exact per-account codes, and a wrong serviceCode makes the
+    ENTIRE createorder call fail with 'Invalid serviceCode' (HTTP 400) — which
+    blocks the order. requestedShippingService is free text and is always
+    accepted; it displays the customer's choice in ShipStation, and you map each
+    label to a real service once via ShipStation's 'Map Requested Service' dialog
+    (after which ShipStation auto-applies it to all future orders with that label).
+
+    WooCommerce stores the chosen method in order['shipping_lines'][*]['method_title'].
+    Returns {} if there's no shipping method (behavior then unchanged)."""
     lines = order.get("shipping_lines")
     if not isinstance(lines, list) or not lines:
         return {}
@@ -542,34 +544,7 @@ def _extract_shipping_method(order):
     title = (line.get("method_title") or "").strip()
     if not title:
         return {}
-
-    out = {"requestedShippingService": title}
-
-    # Conservative mapping keyed on the checkout labels PureX uses.
-    # carrierCode values are ShipStation's standard codes; serviceCode values are
-    # left blank unless we're confident, because a wrong serviceCode is rejected.
-    t = title.lower()
-    if "usps" in t or "ground advantage" in t:
-        out["carrierCode"] = "stamps_com"          # USPS is 'stamps_com' in ShipStation
-        out["serviceCode"] = "usps_ground_advantage"
-    elif "fedex" in t and ("next" in t or "overnight" in t or "1 " in t):
-        out["carrierCode"] = "fedex"
-        out["serviceCode"] = "fedex_standard_overnight"
-    elif "fedex" in t and "2" in t:
-        out["carrierCode"] = "fedex"
-        out["serviceCode"] = "fedex_2day"
-    elif "ups" in t and ("next" in t or "1 " in t):
-        out["carrierCode"] = "ups"
-        out["serviceCode"] = "ups_next_day_air"
-    elif "ups" in t and "2" in t:
-        out["carrierCode"] = "ups"
-        out["serviceCode"] = "ups_2nd_day_air"
-    elif "free" in t and "2-day" in t:
-        # "FREE 2-Day Shipping" — carrier not fixed; leave codes blank so the team
-        # picks the cheapest 2-day. Title still tells them it's a free 2-day order.
-        pass
-    # else: unknown method -> title only, no codes.
-    return out
+    return {"requestedShippingService": title}
 
 
 def ss_create_order(order):
