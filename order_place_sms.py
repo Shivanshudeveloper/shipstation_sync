@@ -550,7 +550,11 @@ def _extract_shipping_method(order):
     out = {"requestedShippingService": title}
     t = title.lower()
 
-    if "usps" in t or "ground advantage" in t:
+    if "free" in t and "2" in t:
+        # "FREE 2-Day Shipping" -> fulfill as FedEx 2Day.
+        out["carrierCode"] = "fedex_walleted"
+        out["serviceCode"] = "fedex_2day"
+    elif "usps" in t or "ground advantage" in t:
         out["carrierCode"] = "stamps_com"
         out["serviceCode"] = "usps_ground_advantage"
     elif "fedex" in t and ("next" in t or "overnight" in t):
@@ -565,7 +569,7 @@ def _extract_shipping_method(order):
     elif "ups" in t and "2" in t:
         out["carrierCode"] = "ups_walleted"
         out["serviceCode"] = "ups_2nd_day_air"
-    # "FREE 2-Day Shipping" and anything else -> label only (carrier not fixed).
+    # anything else -> label only (carrier not fixed).
     return out
 
 
