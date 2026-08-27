@@ -570,6 +570,12 @@ def _extract_shipping_method(order):
         out["carrierCode"] = "ups_walleted"
         out["serviceCode"] = "ups_2nd_day_air"
     # anything else -> label only (carrier not fixed).
+    # If we set a concrete carrier/service, also set a default packageCode so the
+    # shipment is fully configured (an empty Package is one reason ShipStation says
+    # 'no shipping service selected' at label time). 'package' is ShipStation's
+    # universal generic package type. Only added when we mapped a service.
+    if out.get("serviceCode"):
+        out["packageCode"] = "package"
     return out
 
 
@@ -636,6 +642,7 @@ def ss_create_order(order):
                 and ("servicecode" in r.text.lower() or "carriercode" in r.text.lower()):
             body.pop("carrierCode", None)
             body.pop("serviceCode", None)
+            body.pop("packageCode", None)
             # keep requestedShippingService (the label) so the choice still shows
             r2 = requests.post(f"{SHIP_V1_BASE}/orders/createorder",
                                auth=SHIP_V1_AUTH, json=body, timeout=30)
